@@ -1,5 +1,11 @@
 # SeerMini
 
+<p align="center">
+  <a href="Demo/README.md">
+    <img src="README_Assets/1.png" alt="SeerDemo — Library and Search" width="720" />
+  </a>
+</p>
+
 A stripped-down Swift-on-Server vector search engine component of Seer. Two routes, full stack: document registry, HNSW proximity graph, Product Quantization, WAL persistence, and Mistral embeddings.
 
 MLX embedding support can easily be added in the `EmbeddingModelProvider` for on-device support. 
@@ -8,7 +14,7 @@ MLX embedding support can easily be added in the `EmbeddingModelProvider` for on
 
 - Swift 5.10+ / Xcode 15+
 - macOS 14+
-- A [Mistral API key](https://console.mistral.ai/)
+- A [Mistral API key](https://console.mistral.ai/) or Apple Silicon
 
 ## Setup
 
