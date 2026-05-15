@@ -22,15 +22,8 @@ No API key needed. Download the model from the Hub before starting the server:
 
 ```bash
 pip install huggingface_hub
-huggingface-cli download mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ \
-  --local-dir ~/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-0.6B-4bit-DWQ/snapshots/main
-```
-
-Or via Python:
-
-```python
-from huggingface_hub import snapshot_download
-snapshot_download("mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ")
+hf auth login
+hf download mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
 ```
 
 The model is cached in `~/.cache/huggingface/hub/` and loaded on first request when `--use-mlx` is set. Subsequent starts reuse the cached weights with no download.
