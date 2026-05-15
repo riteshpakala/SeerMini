@@ -23,18 +23,18 @@ struct SearchResultCard: View {
     @State private var appeared = false
 
     private var distanceColor: Color {
-        let d = result.distance
+        guard let d = result.distance else { return Color.seerInk.opacity(0.25) }
         if d < 0.35 { return Color(red: 0.30, green: 0.69, blue: 0.31) }
         if d < 0.65 { return Color.seerGold }
         return Color.seerInk.opacity(0.35)
     }
 
     private var shortOwnerId: String {
-        let id = result.documentId
+        let id = result.ownerId
         return id.isEmpty ? "unknown" : String(id.prefix(8))
     }
 
-    private var accentColor: Color { ownerColor(for: result.documentId) }
+    private var accentColor: Color { ownerColor(for: result.ownerId) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -48,19 +48,21 @@ struct SearchResultCard: View {
 
                 Spacer()
 
-                // Distance badge
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(distanceColor)
-                        .frame(width: 6, height: 6)
-                    Text(String(format: "%.4f", result.distance))
-                        .font(.seerMono(9.5))
-                        .foregroundStyle(Color.seerInk.opacity(0.40))
+                // Distance badge — only shown when the server returns a score
+                if let d = result.distance {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(distanceColor)
+                            .frame(width: 6, height: 6)
+                        Text(String(format: "%.4f", d))
+                            .font(.seerMono(9.5))
+                            .foregroundStyle(Color.seerInk.opacity(0.40))
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.seerFill)
+                    .clipShape(Capsule())
                 }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(Color.seerFill)
-                .clipShape(Capsule())
             }
             .padding(.bottom, 14)
 

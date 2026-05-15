@@ -31,9 +31,12 @@ enum FileReader {
         case "md", "markdown":
             return try extractPlainText(url)
 
+        case "html", "htm":
+            return try extractHTML(url)
+
         // Source / data formats treated as plain text
         case "swift", "py", "js", "ts", "jsx", "tsx",
-             "json", "csv", "xml", "html", "htm",
+             "json", "csv", "xml",
              "css", "scss", "rs", "go", "java", "kt",
              "rb", "sh", "c", "cpp", "h", "m", "yaml", "toml":
             return try extractPlainText(url)
@@ -115,6 +118,13 @@ enum FileReader {
             throw FileReaderError.emptyContent
         }
         return s
+    }
+
+    // MARK: - HTML
+
+    private static func extractHTML(_ url: URL) throws -> String {
+        let raw = try extractPlainText(url)
+        return HTMLExtractor.extract(raw)
     }
 
     // MARK: - Plain text

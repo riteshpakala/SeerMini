@@ -88,9 +88,10 @@ actor SeerAPI {
             return SearchResult(
                 id: "result-\(i)",
                 text: text,
-                documentId: ref?.documentId ?? "",
+                documentId: ref?.id ?? "",
                 partitionId: ref?.partitionId ?? "",
-                distance: ref?.distance ?? 0
+                ownerId: ref?.ownerId ?? "",
+                distance: nil
             )
         }
     }
@@ -147,13 +148,13 @@ actor SeerAPI {
         let references: [Reference]
 
         struct Reference: Decodable {
-            let documentId: String
+            let id: String
             let partitionId: String
-            let distance: Float
+            let ownerId: String
             enum CodingKeys: String, CodingKey {
-                case documentId = "document_id"
+                case id
                 case partitionId = "partition_id"
-                case distance
+                case ownerId     = "owner_id"
             }
         }
     }

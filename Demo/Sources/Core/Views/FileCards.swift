@@ -21,6 +21,8 @@ struct FileTypeIcon: View {
             return (Color(red: 0.38, green: 0.55, blue: 0.38), "DAT")
         case "txt", "text":
             return (Color.seerInk.opacity(0.55), "TXT")
+        case "html", "htm":
+            return (Color(red: 0.91, green: 0.42, blue: 0.13), "HTML")
         case "swift":
             return (Color(red: 0.98, green: 0.44, blue: 0.20), "SWF")
         case "py":

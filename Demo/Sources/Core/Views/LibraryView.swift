@@ -40,6 +40,7 @@ struct LibraryView: View {
             allowedContentTypes: [
                 .pdf, .rtf, .rtfd,
                 .plainText, .utf8PlainText,
+                .html,
                 .json, .commaSeparatedText,
                 .sourceCode, .data, .item,
             ],
@@ -179,7 +180,7 @@ struct LibraryView: View {
 
             Spacer()
 
-            Text("Supported: txt · md · pdf · json · csv · rtf · code")
+            Text("Supported: txt · md · pdf · html · json · csv · rtf · code")
                 .font(.seerSans(10))
                 .foregroundStyle(Color.seerInk.opacity(0.20))
                 .padding(.bottom, 24)

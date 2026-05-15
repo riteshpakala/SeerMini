@@ -53,7 +53,6 @@ struct SearchResult: Identifiable {
     let text: String
     let documentId: String
     let partitionId: String
-    let distance: Float
-
-    var relevance: Double { max(0, 1.0 - Double(distance)) }
+    let ownerId: String
+    let distance: Float?   // not currently returned by the server
 }
