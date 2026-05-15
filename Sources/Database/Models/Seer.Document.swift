@@ -1,0 +1,121 @@
+//
+//  SeerDocument.swift
+//  seer-server
+//
+//  Created by Ritesh Pakala on 11/1/25.
+//
+
+import Foundation
+import Vapor
+
+/// Base document object for text-embeddings stored on the
+/// Seer network.
+extension Seer {
+    struct Document: Content, Codable {
+        var id: String
+        var url: URL
+
+        // Ties with Gita owners on-chain.
+        var ownerId: String
+
+        var createdAt: Date = .now
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case url
+            case ownerId = "owner_id"
+            case createdAt = "created_at"
+        }
+
+        init(id: String, url: URL, ownerId: String, createdAt: Date = .now) {
+            self.id = id
+            self.url = url
+            self.ownerId = ownerId
+            self.createdAt = createdAt
+        }
+
+        init(from decoder: any Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id        = try c.decode(String.self, forKey: .id)
+            url       = try c.decode(URL.self,    forKey: .url)
+            ownerId   = try c.decode(String.self, forKey: .ownerId)
+            createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+        }
+    }
+    
+    struct DocumentReference: Codable, Content {
+        var id: String
+        var partitionId: String
+        var ownerId: String
+        
+        enum CodingKeys: String, CodingKey {
+            case id
+            case partitionId = "partition_id"
+            case ownerId = "owner_id"
+        }
+    }
+}
+
+extension Seer {
+    // MARK: - Partition text store
+
+    /// Per-document file holding `[PartitionData]` — written at index time and
+    /// loaded on demand during content resolution.
+    nonisolated func partitionStore(for id: DocumentID) -> FilePersistence {
+        FilePersistence(key: "documents/\(id)-parts", kind: .basic, logger: logger.base)
+    }
+
+    /// Load all partition metadata records for a document. Returns nil when the file
+    /// doesn't exist (fresh install before the first write).
+    nonisolated func partitionDatas(for documentId: DocumentID) -> [PartitionData]? {
+        partitionStore(for: documentId).restore()
+    }
+
+    /// Find a single partition metadata record by ID. Used as the `PartitionDataLoader`
+    /// closure passed into `PartitionTable.search()` and related paths.
+    nonisolated func partitionData(documentId: DocumentID, partitionId: String) -> PartitionData? {
+        partitionDatas(for: documentId)?.first(where: { $0.id == partitionId })
+    }
+
+    /// Build a `PartitionDataLoader` that loads each document's parts file once,
+    /// then serves all partition lookups from the in-memory cache.
+    /// Use this in batch paths (e.g. HNSW visualization) where many nodes from
+    /// the same document would otherwise each trigger a full disk read.
+    nonisolated func makePartitionDataLoader(for documentIds: some Collection<DocumentID>) -> PartitionDataLoader {
+        var cache: [DocumentID: [PartitionData]] = [:]
+        for docId in documentIds {
+            cache[docId] = partitionDatas(for: docId)
+        }
+        return { docId, partId in cache[docId]?.first(where: { $0.id == partId }) }
+    }
+
+    // MARK: - Document store
+
+    /// Helper to retrieve the `FilePersistence` instance of the document.
+    /// - Parameter id: The `DocumentID`.
+    /// - Returns: The `FilePersistence` object.
+    nonisolated func documentStore(for id: DocumentID) -> FilePersistence {
+        FilePersistence(key: "documents/\(id)",
+                        kind: .basic,
+                        logger: logger.base)
+    }
+    /// Retrieve the `Seer.Document` for a `DocumentID`.
+    /// Returns the in-memory cached copy if available; falls back to disk.
+    nonisolated func document(for id: DocumentID) -> Seer.Document? {
+        documentCache.get(id) ?? documentStore(for: id).restore()
+    }
+    /// Helper to retrieve the `FilePersistence` instance of the document.
+    /// - Parameter id: The `DocumentID`.
+    /// - Returns: The `FilePersistence` object.
+    func conversationDocumentStore(for id: DocumentID) -> FilePersistence {
+        FilePersistence(key: "conversations/\(id)",
+                        kind: .basic,
+                        logger: logger.base)
+    }
+    /// Retrieve the conversation `Seer.Document` for a `DocumentID` via `FilePersistence`.
+    /// - Parameter id: The `DocumentID`.
+    /// - Returns: The `Seer.Document` object.
+    func conversationDocument(for id: DocumentID) -> Seer.Document? {
+        conversationDocumentStore(for: id).restore()
+    }
+}

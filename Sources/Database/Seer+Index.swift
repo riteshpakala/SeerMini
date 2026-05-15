@@ -1,0 +1,288 @@
+//
+//  Seer+Index.swift
+//  seer-server
+//
+//  Created by Ritesh Pakala on 11/15/25.
+//
+
+import Foundation
+
+extension Seer {
+    /// A helper function to begin the index process after Seer+Put.
+    /// - Parameters:
+    ///   - id: The DocumentID.
+    ///   - partitions: The partitions related to the document.
+    ///   - request: The SeerRequest with owner information.
+    func index(
+        id: DocumentID,
+        partitions: [Seer.Partition],
+        tags: [String] = [],
+        tagsEmbedding: [Float]? = nil,
+        metadata: Data? = nil,
+        request: SeerRequest
+    ) async {
+        await tableMutator.put(id: id, partitions: partitions, tags: tags, tagsEmbedding: tagsEmbedding, metadata: metadata, request: request)
+    }
+
+    /// Deletes or unlinks every document owned by a user.
+    ///
+    /// Documents where this owner was the last are fully purged (file + global table).
+    /// Documents still held by other owners are only removed from this owner's personal HNSW.
+    @discardableResult
+    func _removeAll(ownerId: String, request: SeerRequest) async -> Int {
+        let (fullyRemoved, allOwned) = await registryMutator.removeAll(ownerId: ownerId)
+
+        for documentId in fullyRemoved { documentCache.evict(documentId) }
+        let idsToDelete = fullyRemoved
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            for documentId in idsToDelete {
+                self.documentStore(for: documentId).purge()
+                self.partitionStore(for: documentId).purge()
+            }
+        }
+
+        await tableMutator.removeAll(documentIds: fullyRemoved, request: request)
+
+        return allOwned.count
+    }
+
+    /// Unlinks a batch of (documentId, ownerId) pairs.
+    /// Fully removes documents where the given owner was the last.
+    func _removeBatch(items: [(documentId: String, ownerId: String)]) async {
+        guard !items.isEmpty else { return }
+
+        let fullyRemovedIds = await registryMutator.removeBatch(items: items)
+
+        for documentId in fullyRemovedIds { documentCache.evict(documentId) }
+        let idsToDelete = fullyRemovedIds
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+            for documentId in idsToDelete {
+                self.documentStore(for: documentId).purge()
+                self.partitionStore(for: documentId).purge()
+            }
+        }
+
+        let dummyRequest = SeerRequest(ownerId: "", group: nil, aggregate: nil, scope: nil, requestID: nil)
+        await tableMutator.removeAll(documentIds: fullyRemovedIds, request: dummyRequest)
+    }
+
+    /// Unlinks an owner from a document. Only purges the physical file and global table
+    /// entry when this owner was the last — otherwise only the personal HNSW is updated.
+    func remove(documentId: String,
+                group: Seer.Group? = nil,
+                ownerId: String) async {
+        let (authorized, fullyRemoved) = await registryMutator.remove(documentId: documentId, group: group, ownerId: ownerId)
+        guard authorized else {
+            logger.warning(
+                "Owner \(ownerId) does not own document \(documentId) — removal rejected",
+                service: .seer
+            )
+            return
+        }
+
+        logger.info("Remove Document", "\(fullyRemoved ? "Fully removing" : "Unlinking") document: \(documentId)", service: .seer)
+
+        if fullyRemoved {
+            documentCache.evict(documentId)
+            await tableMutator.remove(id: documentId)
+            documentStore(for: documentId).purge()
+            partitionStore(for: documentId).purge()
+        }
+    }
+}
+
+extension Seer {
+    func initializeTable() {
+        // ── Path 1: shard-scoped topology file ────────────────────────────────────────────
+        let shardStorage = FilePersistence(key: "shard-\(nodeId)-topology", kind: .basic, logger: logger.base)
+        if var table: PartitionTable = shardStorage.restore() {
+
+            // ── Phase 3 + 4: Open vector store and replay WAL for each shard ──────────────
+            // Shard 0 uses legacy filenames; shard N (N≥1) uses indexed names.
+            for i in table.shards.indices {
+                let vName = i == 0 ? "shard-\(nodeId)-vectors" : "shard-\(nodeId)-\(i)-vectors"
+                let vURL  = FilePersistence.getDefaultURL().appendingPathComponent(vName)
+
+                if let store = try? HNSWVectorStore(url: vURL, nodeCount: table.shards[i].nodes.count),
+                   !store.wasCreatedFresh,
+                   store.isValidFor(nodeCount: table.shards[i].nodes.count) {
+                    table.shards[i].vectorStore = store
+                    tableMutator.seedVectorStore(store, for: i)
+                } else {
+                    // Vector file missing or too small — disable HNSW for this shard until rebuild.
+                    table.shards[i].entryPoint = -1
+                    table.shards[i].maxLevel   = -1
+                    logger.warning(
+                        "⚠️ \(vName) missing or mismatched — shard \(i) HNSW disabled. Run POST /v1/admin/hnsw/rebuild.",
+                        service: .seer
+                    )
+                }
+
+                // Phase 4: Replay WAL for this shard.
+                let wName = i == 0 ? "shard-\(nodeId)-topology-wal" : "shard-\(nodeId)-\(i)-topology-wal"
+                let wURL  = FilePersistence.getDefaultURL().appendingPathComponent(wName)
+                if let w = try? HNSWTopologyWAL(url: wURL),
+                   let records = try? w.readAll(),
+                   !records.isEmpty {
+                    for record in records { table.shards[i].apply(record) }
+                    logger.info(
+                        "Table Init",
+                        "Replayed \(records.count) WAL record(s) for shard \(i)",
+                        service: .seer
+                    )
+                    // Re-open the vector store with the post-WAL node count.
+                    if let existingStore = table.shards[i].vectorStore,
+                       table.shards[i].nodes.count > existingStore.nodeCount,
+                       let refreshed = try? HNSWVectorStore(url: vURL, nodeCount: table.shards[i].nodes.count) {
+                        table.shards[i].vectorStore = refreshed
+                        tableMutator.seedVectorStore(refreshed, for: i)
+                    }
+                }
+            }
+
+            // ── Orphaned shard recovery ───────────────────────────────────────────────────
+            // Shards spawned after the last checkpoint have no entry in the base topology
+            // file (which was saved before they existed), but they DO have WAL files.
+            // Scan for shard-<nodeId>-N-topology-wal files starting beyond the last known
+            // shard index and reconstruct each orphaned shard from its WAL.
+            // WALs are collected here and registered with the actor in the async Task below.
+            var orphanedWals: [(shardIndex: Int, wal: HNSWTopologyWAL)] = []
+            var extraShardIdx = table.shards.count
+            while true {
+                let wName = "shard-\(nodeId)-\(extraShardIdx)-topology-wal"
+                let wURL  = FilePersistence.getDefaultURL().appendingPathComponent(wName)
+                guard FileManager.default.fileExists(atPath: wURL.path()),
+                      let w       = try? HNSWTopologyWAL(url: wURL),
+                      let records = try? w.readAll(),
+                      !records.isEmpty else { break }
+
+                var orphan = HNSWShard()
+                for record in records { orphan.apply(record) }
+
+                let vName = "shard-\(nodeId)-\(extraShardIdx)-vectors"
+                let vURL  = FilePersistence.getDefaultURL().appendingPathComponent(vName)
+                if let store = try? HNSWVectorStore(url: vURL, nodeCount: orphan.nodes.count),
+                   !store.wasCreatedFresh,
+                   store.isValidFor(nodeCount: orphan.nodes.count) {
+                    orphan.vectorStore = store
+                    tableMutator.seedVectorStore(store, for: extraShardIdx)
+                } else {
+                    orphan.entryPoint = -1
+                    orphan.maxLevel   = -1
+                    logger.warning(
+                        "⚠️ \(vName) missing for orphaned shard \(extraShardIdx) — HNSW disabled. Run POST /v1/admin/hnsw/rebuild.",
+                        service: .seer
+                    )
+                }
+                table.shards.append(orphan)
+                orphanedWals.append((extraShardIdx, w))
+                logger.info(
+                    "Table Init",
+                    "⚜️ Recovered orphaned shard \(extraShardIdx) from WAL (\(records.count) record(s), \(orphan.nodes.count) node(s))",
+                    service: .seer
+                )
+                extraShardIdx += 1
+            }
+
+            // Orphan cleanup: remove documents absent from the registry.
+            let validIds         = Set(registryMutator.snapshot.map { Array($0.documentOwners.keys) } ?? [])
+            let orphanedTableIds = table.keys.subtracting(validIds)
+            if !orphanedTableIds.isEmpty {
+                for id in orphanedTableIds { table.remove(id: id) }
+                shardStorage.save(state: table)
+                logger.info(
+                    "Table Init",
+                    "⚠️ Removed \(orphanedTableIds.count) orphaned document(s) from partition table",
+                    service: .seer
+                )
+            }
+
+            // Duplicate-node sweep per shard: mark stale phantom nodes deleted.
+            var totalPhantoms = 0
+            for i in table.shards.indices {
+                var seen: [String: Int] = [:]
+                var phantomCount = 0
+                for (idx, node) in table.shards[i].nodes.enumerated() where !node.isDeleted {
+                    if let canonical = seen[node.partitionId] {
+                        if table.shards[i].partitionLookup[node.partitionId] == idx {
+                            table.shards[i].nodes[canonical].isDeleted = true
+                        } else {
+                            table.shards[i].nodes[idx].isDeleted = true
+                        }
+                        phantomCount += 1
+                    } else {
+                        seen[node.partitionId] = idx
+                    }
+                }
+                if phantomCount > 0 {
+                    let result = table.shards[i].compact()
+                    table.shards[i].vectorStore?.rewrite(order: result.survivingVectorIndices)
+                    totalPhantoms += phantomCount
+                }
+            }
+            if totalPhantoms > 0 {
+                shardStorage.save(state: table)
+                logger.warning(
+                    "⚠️ Removed \(totalPhantoms) phantom node(s) across \(table.shards.count) shard(s)",
+                    service: .seer
+                )
+            }
+
+            tableMutator.seed(table)
+            logger.info("Table Restored", "⚜️ Restore Table [shard-\(nodeId)] — \(table.shards.count) shard(s)", service: .seer)
+
+            // ── Phase 5: Indices file + orphaned WAL registration ────────────────────────
+            let capturedNodeId   = self.nodeId
+            let capturedOrphans  = orphanedWals
+            Task { [weak self] in
+                guard let self else { return }
+                // Register WAL handles for orphaned shards (those recovered above that were
+                // absent from the base topology file). Must happen before any puts so that
+                // new WAL records for those shards go to the right file.
+                for (shardIndex, w) in capturedOrphans {
+                    await tableMutator.registerOrphanedShardWAL(w, byteCount: w.byteSize, for: shardIndex)
+                }
+                if let existing: [DocumentID: PartitionIndex] = tableMutator.loadIndicesFromDisk() {
+                    await tableMutator.mergeIndices(existing)
+                    logger.info(
+                        "Table Init",
+                        "⚜️ Merged \(existing.count) PQ indices for shard-\(capturedNodeId)",
+                        service: .seer
+                    )
+                }
+                // Always fire — unblocks initializeAllPersonalHNSW() regardless of which
+                // path ran (including the no-op path for a fresh install with no indices).
+                await tableMutator.markIndicesReady()
+            }
+            return
+        }
+
+        // ── Path 2: no file found — fresh install ─────────────────────────────────────────
+        if !FileManager.default.fileExists(atPath: shardStorage.url.path()) {
+            // Create the vector store for shard 0 (empty graph).
+            let vectorURL = FilePersistence.getDefaultURL()
+                .appendingPathComponent("shard-\(nodeId)-vectors")
+            if let store = try? HNSWVectorStore(url: vectorURL, nodeCount: 0) {
+                tableMutator.seedVectorStore(store, for: 0)
+            }
+            var empty = PartitionTable()
+            empty.shards[0].vectorStore = tableMutator.vectorStore
+            shardStorage.save(state: empty)
+            tableMutator.seed(empty)
+            logger.info("Table Created", "⚜️ Table Initialized [shard-\(nodeId)]", service: .seer)
+        } else {
+            logger.warning(
+                "⚠️ Partition table exists but failed to decode — starting with empty in-memory table. Re-ingest documents to rebuild the index.",
+                service: .seer
+            )
+        }
+    }
+
+    nonisolated var tableStore: FilePersistence {
+        FilePersistence(key: "shard-\(nodeId)-topology", kind: .basic, logger: logger.base)
+    }
+
+    nonisolated var table: PartitionTable? { tableMutator.snapshot }
+}
