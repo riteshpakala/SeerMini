@@ -16,18 +16,44 @@ MLX embedding support can easily be added in the `EmbeddingModelProvider` for on
 export MISTRAL_API_KEY="your-key-here"
 ```
 
+### MLX (on-device, Apple Silicon)
+
+No API key needed. Download the model from the Hub before starting the server:
+
+```bash
+pip install huggingface_hub
+huggingface-cli download mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ \
+  --local-dir ~/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-0.6B-4bit-DWQ/snapshots/main
+```
+
+Or via Python:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download("mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ")
+```
+
+The model is cached in `~/.cache/huggingface/hub/` and loaded on first request when `--use-mlx` is set. Subsequent starts reuse the cached weights with no download.
+
 ## Build & Run
 
 ```bash
 cd /path/to/SeerMini
 swift build -c release
+
+# Mistral API (default)
 .build/release/seer-mini --host 127.0.0.1 --port 8080
+
+# On-device MLX (Apple Silicon)
+.build/release/seer-mini --host 127.0.0.1 --port 8080 --use-mlx
+.build/release/seer-mini --host 127.0.0.1 --port 8080 --use-mlx --mlx-model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
 ```
 
 Or during development:
 
 ```bash
 swift run seer-mini --host 127.0.0.1 --port 8080
+swift run seer-mini --host 127.0.0.1 --port 8080 --use-mlx
 ```
 
 Check health:
@@ -96,9 +122,16 @@ On startup, both logs are replayed in order before any requests are served.
 
 ### EmbeddingModelProvider
 
-Actor-based Mistral embedding client. Enforces a maximum of 3 concurrent embedding slots with a priority queue. Identical texts within a batch are coalesced into a single API call.
+Two backends, selected at startup with `--use-mlx`:
 
-The model used is `mistral-embed` (1024 dimensions). The API key is read from `MISTRAL_API_KEY` at startup.
+| Backend | Flag | Model | Dimensions |
+|---|---|---|---|
+| Mistral API (default) | _(none)_ | `mistral-embed` | 1024 |
+| On-device MLX | `--use-mlx` | `Qwen3-Embedding-0.6B-4bit-DWQ` (default) | 1024 |
+
+**Mistral** — Actor-based API client. Max 3 concurrent slots with a priority queue; identical texts within a batch are coalesced into one request. Requires `MISTRAL_API_KEY`.
+
+**MLX** — Runs entirely on-device via Apple Silicon GPU. Model is loaded from the Hugging Face Hub cache on first request. No API key or network access needed after download. Use `--mlx-model` to specify a different Hub model ID.
 
 ---
 

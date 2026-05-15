@@ -4,7 +4,7 @@ import Vapor
 func registerSearchRoute(
     _ app: RoutesBuilder,
     _ seer: Seer,
-    embeddingModelProvider: EmbeddingModelProvider
+    embeddingModelProvider: any EmbeddingProviding
 ) {
     app.post("v1", "search") { req async throws -> SearchResponse in
         let searchRequest = try req.content.decode(SearchRequest.self)

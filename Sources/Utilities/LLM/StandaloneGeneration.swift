@@ -4,7 +4,7 @@ import Logging
 class StandaloneGeneration {
     static func runEmbedding(
         _ texts: [String],
-        modelProvider: EmbeddingModelProvider,
+        modelProvider: any EmbeddingProviding,
         logger: Logger,
         priority: Bool = false
     ) async throws -> [EmbeddingData] {

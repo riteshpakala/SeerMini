@@ -51,7 +51,7 @@ extension Seer {
 
     nonisolated func search(_ query: String?,
                 request: SeerRequest,
-                embeddingModelProvider: EmbeddingModelProvider?,
+                embeddingModelProvider: (any EmbeddingProviding)?,
                 topK: Int = 3) async throws -> SearchChatResult {
         guard let query else {
             logger.info("Search", "No query to search.", service: .seer, request: request, flow: .chat)

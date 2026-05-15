@@ -3,7 +3,7 @@ import Foundation
 import Logging
 import Vapor
 
-func configureRoutes(_ app: Application, _ seer: Seer, embeddingModelProvider: EmbeddingModelProvider) async throws {
+func configureRoutes(_ app: Application, _ seer: Seer, embeddingModelProvider: any EmbeddingProviding) async throws {
     registerHealthRoute(app)
     let protected = app.grouped(Middleware())
     registerSearchRoute(protected, seer, embeddingModelProvider: embeddingModelProvider)
@@ -25,7 +25,20 @@ struct SeerMiniServer: AsyncParsableCommand {
     @ArgumentParser.Option(name: .long, help: "Port number.")
     var port: Int = AppConstants.defaultPort
 
-    enum CodingKeys: CodingKey { case host, port }
+    #if canImport(MLX)
+    @ArgumentParser.Flag(name: .long, help: "Use on-device MLX embedding model instead of Mistral API.")
+    var useMLX: Bool = false
+
+    @ArgumentParser.Option(name: .long, help: "MLX Hub model ID for on-device embeddings.")
+    var mlxModel: String = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+    #endif
+
+    enum CodingKeys: CodingKey {
+        case host, port
+        #if canImport(MLX)
+        case useMLX, mlxModel
+        #endif
+    }
 
     @MainActor
     func run() async throws {
@@ -33,7 +46,7 @@ struct SeerMiniServer: AsyncParsableCommand {
         app.logger.logLevel = .debug
 
         let seer = Seer()
-        let embeddingModelProvider = EmbeddingModelProvider(logger: app.logger)
+        let embeddingModelProvider: any EmbeddingProviding = makeEmbeddingProvider(logger: app.logger)
 
         app.routes.defaultMaxBodySize = "100mb"
         configureCORS(app)
@@ -48,6 +61,17 @@ struct SeerMiniServer: AsyncParsableCommand {
         }
         await seer.shutdown()
         try? await app.asyncShutdown()
+    }
+
+    private func makeEmbeddingProvider(logger: Logger) -> any EmbeddingProviding {
+        #if canImport(MLX)
+        if useMLX {
+            logger.info("Embedding backend: MLX (\(mlxModel))")
+            return MLXEmbeddingModelProvider(modelId: mlxModel)
+        }
+        #endif
+        logger.info("Embedding backend: Mistral API (mistral-embed)")
+        return EmbeddingModelProvider(logger: logger)
     }
 
     private func setupApplication() async throws -> Application {
