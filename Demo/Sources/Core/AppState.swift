@@ -35,6 +35,29 @@ final class AppState: ObservableObject {
 
     func checkHealth() async {
         serverReachable = await api.isReachable()
+        if serverReachable == true {
+            await loadLibrary()
+        }
+    }
+
+    // MARK: - Library persistence
+
+    func loadLibrary() async {
+        do {
+            let fetched = try await api.fetchLibrary()
+            guard !fetched.isEmpty else { return }
+            // Merge: keep any locally-uploaded docs from this session,
+            // add server docs that aren't already in the list.
+            let existingIds = Set(documents.map { $0.id })
+            let newDocs = fetched.filter { !existingIds.contains($0.id) }
+            if !newDocs.isEmpty {
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+                    documents.append(contentsOf: newDocs)
+                }
+            }
+        } catch {
+            // Silent fail — library is a convenience; missing it doesn't block usage
+        }
     }
 
     // MARK: - Upload
@@ -74,11 +97,12 @@ final class AppState: ObservableObject {
 
         do {
             let currentAPI = api
-            try await currentAPI.embed(text: text)
+            let filename = url.lastPathComponent
+            try await currentAPI.embed(text: text, filename: filename)
 
             let doc = SeerDocument(
                 id: UUID().uuidString,
-                name: url.lastPathComponent,
+                name: filename,
                 url: url,
                 uploadedAt: Date()
             )

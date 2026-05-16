@@ -5,6 +5,7 @@ private struct PreparedInput {
     let texts: [String]
     let documentId: String
     let tags: [String]
+    let name: String?
     let metadata: Data?
 }
 
@@ -108,11 +109,16 @@ func registerBatchEmbeddingsRoute(
                 ))
             } else if result.texts != nil, let documentId = result.documentId {
                 let docTags = embeddingRequest.tags?[result.index] ?? []
+                let docName: String? = {
+                    guard let names = embeddingRequest.names, result.index < names.count else { return nil }
+                    return names[result.index]
+                }()
                 prepared.append(PreparedInput(
                     index: result.index,
                     texts: result.texts!,
                     documentId: documentId,
                     tags: docTags,
+                    name: docName,
                     metadata: embeddingRequest.metadata?[result.index]
                 ))
             } else if result.documentId != nil {
@@ -199,6 +205,7 @@ func registerBatchEmbeddingsRoute(
                     tagsEmbedding: tagsEmbedding,
                     mediaType: mediaType,
                     update: embeddingRequest.update,
+                    name: docEmbed.preparedInput.name,
                     metadata: docEmbed.preparedInput.metadata
                 ))
                 offset += count

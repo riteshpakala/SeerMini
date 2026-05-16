@@ -27,7 +27,7 @@ actor SeerAPI {
 
     // MARK: - Batch embeddings
 
-    func embed(text: String) async throws {
+    func embed(text: String, filename: String? = nil) async throws {
         guard let url = URL(string: "\(baseURL)/v1/batch/embeddings") else {
             throw APIError.invalidURL
         }
@@ -35,6 +35,7 @@ actor SeerAPI {
         let body = EmbedRequest(
             inputs: [[text]],
             sanitize: true,
+            names: filename.map { [$0] },
             seer: EmbedRequest.SeerParams(
                 ownerId: ownerId,
                 group: EmbedRequest.GroupParams(
@@ -117,6 +118,7 @@ actor SeerAPI {
     private struct EmbedRequest: Encodable {
         let inputs: [[String]]
         let sanitize: Bool
+        let names: [String]?
         let seer: SeerParams
 
         struct SeerParams: Encodable {
@@ -129,6 +131,62 @@ actor SeerAPI {
             let id, label, ownerId: String
             let documents: [String]
             enum CodingKeys: String, CodingKey { case id, label, ownerId = "owner_id", documents }
+        }
+    }
+
+    // MARK: - Library
+
+    func fetchLibrary() async throws -> [SeerDocument] {
+        guard let url = URL(string: "\(baseURL)/v1/library") else {
+            throw APIError.invalidURL
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(LibraryRequest(ownerId: ownerId))
+        req.timeoutInterval = 30
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else { throw APIError.badResponse(0) }
+        guard (200..<300).contains(http.statusCode) else {
+            let msg = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw APIError.badResponse(http.statusCode, msg)
+        }
+
+        let decoded = try JSONDecoder().decode(LibraryResponse.self, from: data)
+
+        var seen = Set<String>()
+        var documents: [SeerDocument] = []
+        for group in decoded.groups {
+            for doc in group.documents {
+                guard seen.insert(doc.id).inserted else { continue }
+                documents.append(SeerDocument(
+                    id: doc.id,
+                    name: doc.name ?? String(doc.id.prefix(8)),
+                    url: nil,
+                    uploadedAt: Date.now
+                ))
+            }
+        }
+        return documents
+    }
+
+    private struct LibraryRequest: Encodable {
+        let ownerId: String
+        enum CodingKeys: String, CodingKey { case ownerId = "owner_id" }
+    }
+
+    private struct LibraryResponse: Decodable {
+        let groups: [LibraryGroup]
+
+        struct LibraryGroup: Decodable {
+            let documents: [LibraryDocument]
+        }
+
+        struct LibraryDocument: Decodable {
+            let id: String
+            let name: String?
         }
     }
 

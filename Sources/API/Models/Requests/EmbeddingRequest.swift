@@ -52,6 +52,8 @@ struct EmbeddingBatchRequest: Content, Codable {
     let mediaType: MediaType?
     /// Per-document metadata payloads; outer index aligns 1:1 with `inputs`.
     let metadata: [Data?]?
+    /// Per-document original filenames; outer index aligns 1:1 with `inputs`.
+    let names: [String?]?
 
     enum CodingKeys: String, CodingKey {
         case inputs
@@ -66,6 +68,7 @@ struct EmbeddingBatchRequest: Content, Codable {
         case tags
         case mediaType = "media_type"
         case metadata
+        case names
     }
 }
 

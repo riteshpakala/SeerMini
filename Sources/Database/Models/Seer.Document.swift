@@ -18,19 +18,25 @@ extension Seer {
         // Ties with Gita owners on-chain.
         var ownerId: String
 
+        /// Original filename supplied by the client at embed time. Optional for
+        /// backward compatibility — absent on documents indexed before this field.
+        var name: String?
+
         var createdAt: Date = .now
 
         enum CodingKeys: String, CodingKey {
             case id
             case url
             case ownerId = "owner_id"
+            case name
             case createdAt = "created_at"
         }
 
-        init(id: String, url: URL, ownerId: String, createdAt: Date = .now) {
+        init(id: String, url: URL, ownerId: String, name: String? = nil, createdAt: Date = .now) {
             self.id = id
             self.url = url
             self.ownerId = ownerId
+            self.name = name
             self.createdAt = createdAt
         }
 
@@ -39,6 +45,7 @@ extension Seer {
             id        = try c.decode(String.self, forKey: .id)
             url       = try c.decode(URL.self,    forKey: .url)
             ownerId   = try c.decode(String.self, forKey: .ownerId)
+            name      = try c.decodeIfPresent(String.self, forKey: .name)
             createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
         }
     }

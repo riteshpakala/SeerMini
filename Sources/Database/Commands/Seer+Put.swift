@@ -10,6 +10,7 @@ extension Seer {
         let tagsEmbedding: [Float]?
         let mediaType: MediaType
         let update: SeerUpdate?
+        let name: String?
         let metadata: Data?
     }
 }
@@ -28,6 +29,7 @@ extension Seer {
              tagsEmbedding: [Float]? = nil,
              mediaType: MediaType = .text,
              update: SeerUpdate? = nil,
+             name: String? = nil,
              metadata: Data? = nil,
              request: SeerRequest) async -> Seer.Document {
         let storage = documentStore(for: id)
@@ -46,7 +48,7 @@ extension Seer {
             ))
         }
 
-        let document = Seer.Document(id: id, url: storage.url, ownerId: request.ownerId)
+        let document = Seer.Document(id: id, url: storage.url, ownerId: request.ownerId, name: name)
         storage.save(state: document)
         documentCache.cache(document)
 
@@ -100,7 +102,7 @@ extension Seer {
                     ownerId: request.ownerId
                 )
             }
-            let document = Seer.Document(id: item.id, url: storage.url, ownerId: request.ownerId)
+            let document = Seer.Document(id: item.id, url: storage.url, ownerId: request.ownerId, name: item.name)
             storage.save(state: document)
             prepared.append(Prepared(document: document, partitions: partitions, update: item.update))
         }

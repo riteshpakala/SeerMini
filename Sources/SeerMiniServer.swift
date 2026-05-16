@@ -8,6 +8,7 @@ func configureRoutes(_ app: Application, _ seer: Seer, embeddingModelProvider: a
     let protected = app.grouped(Middleware())
     registerSearchRoute(protected, seer, embeddingModelProvider: embeddingModelProvider)
     registerBatchEmbeddingsRoute(protected, seer, embeddingModelProvider: embeddingModelProvider)
+    registerLibraryRoute(protected, seer)
 }
 
 // Pass-through middleware — no auth in SeerMini; ownerId comes from the request body.

@@ -5,7 +5,7 @@ import Foundation
 struct SeerDocument: Identifiable, Equatable {
     let id: String
     let name: String
-    let url: URL
+    let url: URL?
     let uploadedAt: Date
 }
 
