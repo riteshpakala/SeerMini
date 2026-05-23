@@ -307,8 +307,12 @@ extension HNSWGraph {
             }
 
         case .entryPointChanged(let nodeIndex, let maxLevel):
-            entryPoint    = nodeIndex   // idempotent (-1 is valid: empty graph)
+            guard nodeIndex == -1 || nodeIndex < nodes.count else { break }  // bounds guard
+            entryPoint    = nodeIndex
             self.maxLevel = maxLevel
+
+        case .commit:
+            break
         }
     }
 }
@@ -362,6 +366,7 @@ extension HNSWGraph {
             // Always emit — covers both new entry point and empty-graph (-1/-1) cases.
             pendingWALRecords.append(.entryPointChanged(nodeIndex: newEP, maxLevel: newMax))
         }
+        pendingWALRecords.append(.commit)
     }
 
     /// No-op. HNSW inserts incrementally on every `add(partition:)`.
@@ -555,6 +560,7 @@ extension HNSWGraph {
         guard let store = vectorStore  else { return ([], emptyTrace) }
 
         var ep             = entryPoint
+        guard ep < nodes.count else { return ([], emptyTrace) }
         var upperLayerHops = [Int]()
         var layer0Candidates: [HNSWCandidate] = []
         var layer0Explored:   Int = 0
@@ -650,6 +656,13 @@ private extension HNSWGraph {
         }
 
         var ep = entryPoint
+        if ep >= nodes.count {
+            var bestEP = -1, bestLevel = -1
+            for (idx, node) in nodes.enumerated() where idx != newIdx && !node.isDeleted {
+                if node.level > bestLevel { bestLevel = node.level; bestEP = idx }
+            }
+            entryPoint = bestEP; maxLevel = bestLevel; ep = bestEP
+        }
 
         // Step 3: Greedy descent from maxLevel to newLevel + 1 (read lock).
         if maxLevel > newLevel {
@@ -759,6 +772,7 @@ private extension HNSWGraph {
         if newLevel > oldMaxLevel {
             pendingWALRecords.append(.entryPointChanged(nodeIndex: newIdx, maxLevel: newLevel))
         }
+        pendingWALRecords.append(.commit)
     }
 
     // MARK: Graph traversal

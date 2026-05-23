@@ -35,6 +35,10 @@ enum TopologyWALRecord: Equatable {
     case nodeDeleted(nodeIndex: Int)
     /// The global entry point changed. Use nodeIndex = -1 / maxLevel = -1 for empty graph.
     case entryPointChanged(nodeIndex: Int, maxLevel: Int)
+    /// Marks the end of one atomic mutation group. All preceding records since the last
+    /// `.commit` form a single transaction; `readAll()` discards any uncommitted tail
+    /// left by a crash mid-flush.
+    case commit
 }
 
 // MARK: - TopologyWALRecord binary encoding
@@ -46,6 +50,7 @@ extension TopologyWALRecord {
         case neighborsUpdated  = 0x02
         case nodeDeleted       = 0x03
         case entryPointChanged = 0x04
+        case commit            = 0x05
     }
 
     var typeCode: UInt8 {
@@ -54,6 +59,7 @@ extension TopologyWALRecord {
         case .neighborsUpdated:  return TypeCode.neighborsUpdated.rawValue
         case .nodeDeleted:       return TypeCode.nodeDeleted.rawValue
         case .entryPointChanged: return TypeCode.entryPointChanged.rawValue
+        case .commit:            return TypeCode.commit.rawValue
         }
     }
 
@@ -84,6 +90,9 @@ extension TopologyWALRecord {
         case .entryPointChanged(let nodeIndex, let maxLevel):
             buf.walInt32(Int32(nodeIndex))
             buf.walInt32(Int32(maxLevel))
+
+        case .commit:
+            break  // empty payload
         }
         return buf
     }
@@ -127,6 +136,9 @@ extension TopologyWALRecord {
             let nodeIndex = Int(try r.int32())
             let maxLevel  = Int(try r.int32())
             return .entryPointChanged(nodeIndex: nodeIndex, maxLevel: maxLevel)
+
+        case TypeCode.commit.rawValue:
+            return .commit
 
         default:
             throw HNSWTopologyWAL.WALError.unknownTypeCode(typeCode)
@@ -209,9 +221,21 @@ final class HNSWTopologyWAL: @unchecked Sendable {
 
     // MARK: - Read
 
-    /// Reads all valid records in insertion order. Stops — without throwing — at the first
-    /// record with a bad checksum or a truncated payload (crash-during-write recovery).
-    /// Returns the complete prefix of valid records.
+    /// Reads all committed records in insertion order.
+    ///
+    /// **Commit-group semantics:** Records are accumulated in a `pending` buffer and moved
+    /// to `committed` only when a `.commit` record is encountered. Any uncommitted tail
+    /// (records after the last `.commit`) is silently discarded — this is the normal result
+    /// of a crash mid-flush and guarantees that only fully-written mutation groups are replayed.
+    ///
+    /// **Backward compatibility:** WAL files written before `.commit` was introduced contain
+    /// no commit records. If the full decode loop yields no committed records but does yield
+    /// pending records, the old-format fallback applies all checksummed records as before.
+    /// This provides a lossless first restart after an upgrade; subsequent WALs use the new
+    /// format from the next checkpoint onward.
+    ///
+    /// Stops — without throwing — at the first record with a bad checksum or a truncated
+    /// payload (crash-during-write recovery).
     func readAll() throws -> [TopologyWALRecord] {
         guard byteSize > 0 else { return [] }
 
@@ -223,7 +247,8 @@ final class HNSWTopologyWAL: @unchecked Sendable {
         guard n > 0 else { return [] }
         let available = n   // might be less than byteSize if file was truncated concurrently
 
-        var records: [TopologyWALRecord] = []
+        var committed: [TopologyWALRecord] = []
+        var pending:   [TopologyWALRecord] = []
         var offset = 0
 
         while offset + 9 <= available {               // 9 = typeCode(1) + length(4) + checksum(4)
@@ -251,9 +276,19 @@ final class HNSWTopologyWAL: @unchecked Sendable {
 
             guard let rec = try? TopologyWALRecord.decodePayload(typeCode: typeCode, data: payload)
             else { break }                                       // unknown type — stop here
-            records.append(rec)
+
+            if rec == .commit {
+                committed.append(contentsOf: pending)
+                pending = []
+            } else {
+                pending.append(rec)
+            }
         }
-        return records
+
+        // Backward-compat: old WALs have no .commit records. If nothing was committed but
+        // there are valid pending records, treat the whole file as one implicit commit group.
+        if committed.isEmpty && !pending.isEmpty { return pending }
+        return committed
     }
 
     // MARK: - Checkpoint truncation

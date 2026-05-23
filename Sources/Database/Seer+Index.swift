@@ -224,6 +224,16 @@ extension Seer {
             }
             if totalPhantoms > 0 {
                 shardStorage.save(state: table)
+                // Truncate all shard WALs — the snapshot just saved is authoritative.
+                // Pre-compaction WAL records use old node indices; replaying them on the
+                // renumbered post-compact graph would corrupt entryPoint and neighbor refs.
+                for i in table.shards.indices {
+                    let wName = i == 0
+                        ? "shard-\(nodeId)-topology-wal"
+                        : "shard-\(nodeId)-\(i)-topology-wal"
+                    let wURL = FilePersistence.getDefaultURL().appendingPathComponent(wName)
+                    if let w = try? HNSWTopologyWAL(url: wURL) { try? w.truncate() }
+                }
                 logger.warning(
                     "⚠️ Removed \(totalPhantoms) phantom node(s) across \(table.shards.count) shard(s)",
                     service: .seer
@@ -236,26 +246,36 @@ extension Seer {
             // ── Phase 5: Indices file + orphaned WAL registration ────────────────────────
             let capturedNodeId   = self.nodeId
             let capturedOrphans  = orphanedWals
-            Task { [weak self] in
-                guard let self else { return }
+            let capturedMutator  = tableMutator
+            let capturedLogger   = logger
+            Task {
                 // Register WAL handles for orphaned shards (those recovered above that were
                 // absent from the base topology file). Must happen before any puts so that
                 // new WAL records for those shards go to the right file.
                 for (shardIndex, w) in capturedOrphans {
-                    await tableMutator.registerOrphanedShardWAL(w, byteCount: w.byteSize, for: shardIndex)
+                    await capturedMutator.registerOrphanedShardWAL(w, byteCount: w.byteSize, for: shardIndex)
                 }
-                if let existing: [DocumentID: PartitionIndex] = tableMutator.loadIndicesFromDisk() {
-                    await tableMutator.mergeIndices(existing)
-                    logger.info(
+                if let existing: [DocumentID: PartitionIndex] = capturedMutator.loadIndicesFromDisk() {
+                    await capturedMutator.mergeIndices(existing)
+                    capturedLogger.info(
                         "Table Init",
                         "⚜️ Merged \(existing.count) PQ indices for shard-\(capturedNodeId)",
                         service: .seer
                     )
                 }
-                // Always fire — unblocks initializeAllPersonalHNSW() regardless of which
+                // Always fire — unblocks waitForIndices() regardless of which
                 // path ran (including the no-op path for a fresh install with no indices).
+                await capturedMutator.markIndicesReady()
+            }
+
+            // Guardian: last-resort unblock if loadIndicesFromDisk hangs indefinitely
+            // (e.g., corrupt plist, I/O stall). 300 s is conservative — normal decoding
+            // of even very large indices files completes well within this window.
+            Task { [tableMutator] in
+                try? await Task.sleep(for: .seconds(300))
                 await tableMutator.markIndicesReady()
             }
+
             return
         }
 

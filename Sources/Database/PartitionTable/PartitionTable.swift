@@ -19,7 +19,6 @@ typealias PartitionSearchResult = (scores: [Float], partitions: [Seer.Partition]
 struct PartitionTable: Codable {
     /// All indexed document IDs. Set for O(1) insert and remove.
     var keys: Set<DocumentID> = []
-    var indices: [DocumentID: PartitionIndex] = [:]
     /// All global HNSW shards. Starts as a single shard; `TableMutator` appends new shards when
     /// the active shard reaches `SeerConfig.shardSizeThreshold` nodes.
     var shards: [HNSWShard] = [.init()]
@@ -64,6 +63,22 @@ struct PartitionTable: Codable {
 
     init() {}
 
+    // MARK: - Computed index access
+
+    /// Aggregated view of all per-shard PQ indices. Use `index(for:)` for O(1) point lookups.
+    var indices: [DocumentID: PartitionIndex] {
+        var result = [DocumentID: PartitionIndex]()
+        result.reserveCapacity(keys.count)
+        for shard in shards { result.merge(shard.indices, uniquingKeysWith: { a, _ in a }) }
+        return result
+    }
+
+    /// O(1) lookup: routes to the correct shard via `documentShardIndex`.
+    func index(for docId: DocumentID) -> PartitionIndex? {
+        guard let si = documentShardIndex[docId], si < shards.count else { return nil }
+        return shards[si].indices[docId]
+    }
+
     // MARK: - Active shard convenience
 
     /// Index of the currently active (write-target) shard.
@@ -94,6 +109,7 @@ struct PartitionTable: Codable {
         // shard, mark its old nodes deleted there. Must be read before documentShardIndex[id]
         // is overwritten — otherwise the routing entry is lost.
         if let prevSI = documentShardIndex[id], prevSI != si, prevSI < shards.count {
+            shards[prevSI].indices.removeValue(forKey: id)
             shards[prevSI].remove(documentId: id)
         }
         documentShardIndex[id] = si
@@ -158,7 +174,7 @@ struct PartitionTable: Codable {
         index.train(insertedPartitions, tags: tags, tagsEmbedding: tagsEmbedding,
                     documentId: id, logger: logger)
         index.metadata = metadata
-        indices[id] = index
+        shards[si].indices[id] = index
         keys.insert(id)
 
     }
@@ -176,15 +192,17 @@ struct PartitionTable: Codable {
 
     /// Removes an index for a DocumentID. O(1) when `documentShardIndex` is populated.
     mutating func remove(id: DocumentID) {
-        indices.removeValue(forKey: id)
         keys.remove(id)
         if let si = documentShardIndex.removeValue(forKey: id) {
+            shards[si].indices.removeValue(forKey: id)
             shards[si].remove(documentId: id)
         } else {
             // Legacy path: document predates documentShardIndex — scan all shards.
-            for i in shards.indices { shards[i].remove(documentId: id) }
+            for i in shards.indices {
+                shards[i].indices.removeValue(forKey: id)
+                shards[i].remove(documentId: id)
+            }
         }
-
     }
 
     // MARK: - Search
@@ -263,12 +281,12 @@ struct PartitionTable: Codable {
                 guard shards[i].isTrained else { continue }
                 let shardThreshold = shards[i].effectiveThreshold
                 let (shardResults, trace) = shards[i].search(
+                    shardIndex: i,
                     queryEmbedding: embedding,
                     queryTagEmbedding: queryTagEmbedding,
                     k: k * 10,
                     groupFilter: groupDocIds,
                     accessFilter: accessFilter,
-                    indices: indices,
                     sinatra: sinatra,
                     ownerKey: ownerKey,
                     sinatraRegistry: sinatraRegistry,
@@ -346,7 +364,7 @@ struct PartitionTable: Codable {
                         }
                         let candidate = groupDocIds.compactMap { docId
                             -> (partition: Seer.Partition, raw: Float, norm: Float)? in
-                            guard let idx = indices[docId] else { return nil }
+                            guard let idx = index(for: docId) else { return nil }
                             return idx.searchWithScores(queryEmbedding: embedding, k: 1,
                                                         metadataLoader: metadataLoader).first
                                 .map { (partition: $0.0, raw: $0.1, norm: $0.1) }
@@ -469,11 +487,11 @@ struct PartitionTable: Codable {
                 guard shards[i].isTrained else { continue }
                 let shardThreshold = shards[i].effectiveThreshold
                 let (shardResults, trace) = shards[i].search(
+                    shardIndex: i,
                     queryEmbedding: embedding,
                     queryTagEmbedding: queryTagEmbedding,
                     k: k * 10,
                     groupFilter: combinedFilter,
-                    indices: indices,
                     sinatra: sinatra,
                     ownerKey: ownerKey,
                     sinatraRegistry: sinatraRegistry,
@@ -605,7 +623,7 @@ struct PartitionTable: Codable {
             rawLinearResults.withUnsafeMutableBufferPointer { buffer in
                 DispatchQueue.concurrentPerform(iterations: candidateArray.count) { i in
                     let id = candidateArray[i]
-                    guard let index = indices[id] else { return }
+                    guard let index = self.index(for: id) else { return }
                     buffer[i] = index.search(
                         queryEmbedding: embedding,
                         k: k,

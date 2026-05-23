@@ -23,6 +23,11 @@ let package = Package(
         .product(name: "mlx_embeddings", package: "mlx.embeddings"),   // uncomment with MLX packages above
       ],
       path: "Sources"
+    ),
+    .testTarget(
+      name: "seer-mini-tests",
+      dependencies: ["seer-mini"],
+      path: "Tests/seer-mini-tests"
     )
   ]
 )

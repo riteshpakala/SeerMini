@@ -18,8 +18,12 @@ import Foundation
 
 struct HNSWShard: Codable {
     var graph: HNSWGraph = .init()
+    /// Per-document PQ index for this shard. Excluded from the topology plist — loaded
+    /// separately from `shard-<nodeId>-<i>-indices` and merged in at startup.
+    var indices: [DocumentID: PartitionIndex] = [:]
 
     // MARK: - Codable (transparent — same on-disk format as HNSWGraph; zero migration)
+    // `indices` is intentionally excluded: topology and PQ data persist in separate files.
 
     init() {}
 
@@ -114,14 +118,13 @@ extension HNSWShard {
     ///   - k: Size of the HNSW candidate pool (typically `outerK * 10`). The caller
     ///     applies the final top-k cut after access-class filtering and Sinatra.
     ///   - groupFilter: Access-control predicate. Intersected with the tag filter.
-    ///   - indices: Per-document `PartitionIndex` map used for slot resolution.
     mutating func search(
+        shardIndex: Int,
         queryEmbedding: [Float],
         queryTagEmbedding: [Float]?,
         k: Int,
         groupFilter: Set<DocumentID>?,
         accessFilter: ((DocumentID) -> Bool)? = nil,
-        indices: [DocumentID: PartitionIndex],
         sinatra: Sinatra,
         ownerKey: SeerRegistry.Owner,
         sinatraRegistry: SinatraRegistry?,
@@ -136,7 +139,7 @@ extension HNSWShard {
         // Only apply when the caller explicitly provides a tag embedding. Falling back
         // to the query embedding as a proxy produces false exclusions: a natural-language
         // query rarely matches short tag keywords at the required distance threshold.
-        let taggedIndices = indices.filter { $0.value.tagsEmbedding != nil }
+        let taggedIndices = self.indices.filter { $0.value.tagsEmbedding != nil }
         var tagPreFilterData: [(documentId: DocumentID, tagDistance: Float?, wasIncluded: Bool)] = []
 
         let tagFilteredDocIds: Set<DocumentID>? = {
@@ -157,15 +160,23 @@ extension HNSWShard {
                 tagPreFilterData.append((docId, dist, included))
                 if included { passing.append(docId) }
             }
-            let untagged = indices.filter { $0.value.tagsEmbedding == nil }.map { $0.key }
+            let untagged = self.indices.filter { $0.value.tagsEmbedding == nil }.map { $0.key }
             return Set(passing + untagged)
         }()
 
-        logger.info(
-            "Tag Pre-Filter",
-            "docs tagged=\(taggedIndices.count) passed=\(tagPreFilterData.filter(\.wasIncluded).count) excluded=\(tagPreFilterData.filter { !$0.wasIncluded }.count)",
-            service: .seer, request: request, flow: .chat
-        )
+        if queryTagEmbedding == nil {
+            logger.info(
+                "Tag Pre-Filter",
+                "[shard=\(shardIndex)] skipped — no tag embedding provided (docs tagged=\(taggedIndices.count))",
+                service: .seer, request: request, flow: .chat
+            )
+        } else {
+            logger.info(
+                "Tag Pre-Filter",
+                "[shard=\(shardIndex)] docs tagged=\(taggedIndices.count) passed=\(tagPreFilterData.filter(\.wasIncluded).count) excluded=\(tagPreFilterData.filter { !$0.wasIncluded }.count)",
+                service: .seer, request: request, flow: .chat
+            )
+        }
         if !tagPreFilterData.isEmpty {
             sinatra.parkIndices(data: tagPreFilterData, request: request)
         }
@@ -193,13 +204,14 @@ extension HNSWShard {
 
         logger.info(
             "HNSW Search",
-            "[Global] layers=\(trace.graphMaxLevel + 1) hops=\(trace.upperLayerHops) ef=\(trace.efUsed) explored=\(trace.layer0Explored) candidates=\(trace.candidatesBeforeFilter) threshold=\(String(format: "%.4f", trace.threshold))",
+            "[shard=\(shardIndex)] layers=\(trace.graphMaxLevel + 1) hops=\(trace.upperLayerHops) ef=\(trace.efUsed) explored=\(trace.layer0Explored) candidates=\(trace.candidatesBeforeFilter) threshold=\(String(format: "%.4f", trace.threshold))",
             service: .seer, request: request, flow: .chat
         )
+
         // ── Slot resolution + deduplication ─────────────────────────────────────
         var rawByPartitionId: [String: (partition: Seer.Partition, distance: Float)] = [:]
         for r in hnswResults {
-            guard let idx = indices[r.documentId],
+            guard let idx = self.indices[r.documentId],
                   let slot = idx.slots.first(where: { $0.id == r.partitionId })
             else { continue }
             let p = slot.toPartition(metadata: metadataLoader?(r.documentId, r.partitionId), indexMetadata: idx.metadata)
@@ -211,10 +223,10 @@ extension HNSWShard {
         }
         let resolved = rawByPartitionId.values.sorted { $0.distance < $1.distance }
 
-        let filterLabel = nodeFilter != nil ? "[Global+filter]" : "[Global]"
+        let filterLabel = nodeFilter != nil ? "filter" : "global"
         logger.info(
             "HNSW Search",
-            "\(filterLabel) resolved=\(resolved.count)/\(hnswResults.count)",
+            "[shard=\(shardIndex)/\(filterLabel)] resolved=\(resolved.count)/\(hnswResults.count)",
             service: .seer, request: request, flow: .chat
         )
 

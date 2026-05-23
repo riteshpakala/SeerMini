@@ -28,7 +28,7 @@ actor TableMutator {
     // MARK: - Indices persistence (split from topology — Phase 5)
 
     nonisolated(unsafe) private let indicesPersistence: FilePersistence
-    private let indicesIO:                              PersistenceActor
+    private let indicesSeerLogger: SeerLogger
 
     // MARK: - WAL (Phase 4 — one WAL file per shard)
     //
@@ -104,7 +104,7 @@ actor TableMutator {
             logger: logger.base
         )
         self.indicesPersistence = ip
-        self.indicesIO          = PersistenceActor(persistence: ip)
+        self.indicesSeerLogger  = logger
         self.logger = logger
         // Open (or create) the WAL file for shard 0. Additional shards' WALs are opened
         // lazily in putBatch when those shards are spawned.
@@ -121,18 +121,62 @@ actor TableMutator {
     nonisolated func seed(_ initial: PartitionTable) { cache.seed(initial) }
 
     nonisolated func loadIndicesFromDisk() -> [DocumentID: PartitionIndex]? {
-        indicesPersistence.restore()
+        var merged = [DocumentID: PartitionIndex]()
+        var foundAny = false
+        var i = 0
+        while true {
+            let fp = FilePersistence(key: "shard-\(nodeId)-\(i)-indices", kind: .basic, logger: indicesSeerLogger.base)
+            guard FileManager.default.fileExists(atPath: fp.url.path()) else { break }
+            if let dict: [DocumentID: PartitionIndex] = fp.restore() {
+                merged.merge(dict, uniquingKeysWith: { a, _ in a })
+                foundAny = true
+            }
+            i += 1
+        }
+        if foundAny { return merged }
+        return indicesPersistence.restore()  // legacy single-file fallback
     }
 
     func mergeIndices(_ indices: [DocumentID: PartitionIndex]) async {
         guard var table = cache.snapshot else { return }
-        for (docId, index) in indices where table.indices[docId] == nil {
-            table.indices[docId] = index
+        for (docId, index) in indices where table.index(for: docId) == nil {
+            guard let si = table.documentShardIndex[docId], si < table.shards.count else { continue }
+            table.shards[si].indices[docId] = index
         }
         cache.update(table)
     }
 
     func markIndicesReady() {
+        guard !_indicesReady else { return }
+
+        // Tombstone HNSW nodes for documents whose PQ index was lost — indexed after
+        // the last indices-file flush, then the server crashed before the 3s debounce
+        // fired. WAL restores the graph nodes; the stale indices file has no entry.
+        // These docs will never resolve in search until re-indexed, so mark them
+        // deleted now so HNSW stops returning them as unresolvable candidates.
+        //
+        // Guard: if indices is completely empty but keys is non-empty, the guardian
+        // deadline fired before mergeIndices() ran (loadIndicesFromDisk took >300 s).
+        // In that case every key would look orphaned — skip tombstoning and let the
+        // real markIndicesReady() call (from the Phase 5 Task) handle it once
+        // mergeIndices completes. The guardian only unblocks waiters here.
+        if var table = cache.snapshot, table.shards.contains(where: { !$0.indices.isEmpty }) {
+            let orphanedIds = table.keys.filter { table.index(for: $0) == nil }
+            if !orphanedIds.isEmpty {
+                for id in orphanedIds {
+                    table.remove(id: id)
+                }
+                for i in table.shards.indices {
+                    table.shards[i].pendingWALRecords = []
+                }
+                cache.update(table)
+                logger.warning(
+                    "⚠️ [Table Init] Tombstoned \(orphanedIds.count) orphaned HNSW node(s) — PQ index missing after crash; re-index required: \(orphanedIds.prefix(5))",
+                    service: .seer
+                )
+            }
+        }
+
         _indicesReady = true
         let waiters = _indicesWaiters
         _indicesWaiters = []
@@ -152,8 +196,19 @@ actor TableMutator {
                         logger: logger.base).save(state: metadata)
     }
 
-    private func saveIndicesAsync(_ indices: [DocumentID: PartitionIndex]) {
-        Task.detached { [indicesIO] in await indicesIO.save(indices) }
+    private func saveIndicesAsync(_ table: PartitionTable) {
+        let shards    = table.shards
+        let nodeId    = self.nodeId
+        let baseLogger = indicesSeerLogger.base
+        Task.detached {
+            for i in shards.indices {
+                FilePersistence(
+                    key:    "shard-\(nodeId)-\(i)-indices",
+                    kind:   .basic,
+                    logger: baseLogger
+                ).save(state: shards[i].indices)
+            }
+        }
     }
 
     // MARK: - Snapshot
@@ -194,7 +249,7 @@ actor TableMutator {
         }
     }
 
-    private func scheduleIndicesSave(_ indices: [DocumentID: PartitionIndex]) {
+    private func scheduleIndicesSave() {
         indicesDirty = true
         guard indicesFlushTask == nil else { return }
         indicesFlushTask = Task {
@@ -207,7 +262,7 @@ actor TableMutator {
         guard indicesDirty, let table = cache.snapshot else {
             indicesFlushTask = nil; return
         }
-        saveIndicesAsync(table.indices)
+        saveIndicesAsync(table)
         indicesDirty      = false
         indicesFlushTask  = nil
     }
@@ -258,7 +313,13 @@ actor TableMutator {
         for (i, w) in wals { try? w.truncate(); walByteCounts[i] = 0 }
         tableDirty   = false
 
-        await indicesIO.save(table.indices)
+        for i in table.shards.indices {
+            FilePersistence(
+                key:    "shard-\(nodeId)-\(i)-indices",
+                kind:   .basic,
+                logger: indicesSeerLogger.base
+            ).save(state: table.shards[i].indices)
+        }
         indicesDirty = false
     }
 
@@ -279,7 +340,7 @@ actor TableMutator {
             }
         }
         if indicesDirty {
-            saveIndicesAsync(table.indices)
+            saveIndicesAsync(table)
             indicesDirty     = false
             indicesFlushTask?.cancel()
             indicesFlushTask = nil
@@ -303,7 +364,7 @@ actor TableMutator {
             }
         }
         if indicesDirty {
-            saveIndicesAsync(table.indices)
+            saveIndicesAsync(table)
             indicesDirty     = false
             indicesFlushTask?.cancel()
             indicesFlushTask = nil
@@ -378,7 +439,7 @@ actor TableMutator {
                   metadata: metadata, request: request, logger: logger, targetShard: targetSI)
         scheduleSave(draining: &table)
         cache.update(table)
-        scheduleIndicesSave(table.indices)
+        scheduleIndicesSave()
     }
 
     func putBatch(items: [(id: DocumentID, partitions: [Seer.Partition], tags: [String], tagsEmbedding: [Float]?, metadata: Data?, request: SeerRequest)]) async {
@@ -404,7 +465,7 @@ actor TableMutator {
         }
         scheduleSave(draining: &table)
         cache.update(table)
-        scheduleIndicesSave(table.indices)
+        scheduleIndicesSave()
         scheduleCompactIfNeeded()
     }
 
@@ -428,7 +489,7 @@ actor TableMutator {
                 self.walByteCounts[i] = 0
             }
         }
-        saveIndicesAsync(table.indices)
+        saveIndicesAsync(table)
     }
 
     func removeAll(documentIds: [DocumentID], request: SeerRequest) async {
@@ -455,7 +516,7 @@ actor TableMutator {
                 self.walByteCounts[i] = 0
             }
         }
-        saveIndicesAsync(table.indices)
+        saveIndicesAsync(table)
         logger.info(
             "Remove All",
             "Purged \(documentIds.count) document(s) from partition table",
@@ -544,6 +605,6 @@ actor TableMutator {
         compactTask?.cancel()
         compactTask = nil
         checkpoint()
-        saveIndicesAsync(table.indices)
+        saveIndicesAsync(table)
     }
 }
